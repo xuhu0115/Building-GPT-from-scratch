@@ -243,47 +243,89 @@ class GPT(nn.Module): #定义了一个继承自 torch.nn.Module 的新类 GPT。
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
-# 创建小型数据加载器
+# ------------------------------------------------------------------------
+import tiktoken
+import numpy as np
+
+def load_tokens(filename):
+    npt = np.load(filename)   # 加载UN16 numpy文件
+    npt = npt.astype(np.int32) # added after video
+    ptt = torch.tensor(npt, dtype=torch.long)  # 转换为torch.long
+    return ptt
+
+# 分布式数据加载器
+# 改写数据加载器，使每个进程都能获取属于自己的数据块，使其处理数据的不同部分
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
-        
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        assert split in {'train', 'val'}
+
         with open('/amax/xuhu/project/Build-Nanopgpt/input.txt', 'r') as f:
             text = f.read()
         enc = tiktoken.get_encoding('gpt2')
         tokens = enc.encode(text)
+
         self.tokens = torch.tensor(tokens)
         print(f"loaded {len(self.tokens)} tokens")
         print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
         # state
-        self.current_position = 0
-        
+        self.current_position = self.B *self.T * self.process_rank
+    
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
         x = (buf[:-1]).view(B, T) # inputs
         y = (buf[1:]).view(B, T) # targets
         # advance the position in the tensor
-        self.current_position += B * T 
+        self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds, advance to next shard
-        if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
         return x, y
     
 # ------------------------------------------------------------------------------------------------------------------------------------------------------
-# model = GPT.from_pretrained("gpt2")
-# print("did't crash yay!") # 没有撞车耶！
+# simple launch:
+# python train_gpt2.py
+# DDP launch for e.g. 8 GPUs:
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
 
+# run the training loop
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
-# 自动检测GPU
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-print(f"using device: {device}")
+# set up DDP (distributed data parallel).
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device(自动检测设备)
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available(): # 如果 CUDA 不可用，则检查是否有 MPS 设备可用。MPS 主要用于 Apple 的硬件，特别是 macOS 上的设备。通过 hasattr(torch.backends, "mps") 检查 torch.backends 模块中是否存在 mps 属性，然后调用 torch.backends.mps.is_available() 来确认 MPS 是否可用。如果 MPS 可用，则将 device 设置为 "mps"
+        device = "mps"
+    print(f"using device: {device}")
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -296,12 +338,21 @@ torch.set_float32_matmul_precision('high')
 total_batch_size = 524288 # 2**19, ~0.5M = 50万, in number of tokens
 B = 16 # micro batch size：控制在一次前向后向中处理多少token和行
 T = 1024 # sequence length
-assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
-grad_accum_steps = total_batch_size // (B * T)
-print(f"total desired batch size: {total_batch_size}")
-print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)  # 524288//16*1024*8=4
 
-train_loader = DataLoaderLite(B = B,T = T)
+# 每个进程都会打印一遍，总共八遍，为了保持只打印一次，我们只在主进程上打印
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+# print("I'm GPU ",ddp_rank)
+# print("Bye!")
+# import sys; sys.exit(0)  #退出
+
+
+train_loader = DataLoaderLite(B = B, T = T, process_rank = ddp_rank, num_processes = ddp_world_size, split="train" )
+
 # # get a data batch
 # import tiktoken
 # enc = tiktoken.get_encoding('gpt2')
@@ -315,11 +366,16 @@ train_loader = DataLoaderLite(B = B,T = T)
 # x = buf[:-1].view(B, T)
 # y = buf[1:].view(B, T)
 
-# get logits
+# create model
 model = GPT(GPTConfig(vocab_size=50304))  # 修改为2的幂形式，可以加快计算
 model.to(device)
 # 它允许用户通过简单的 API 调用来启用 Just-In-Time (JIT) 编译器和优化器，从而提高模型的执行效率
 model = torch.compile(model)
+
+#将模型包装到 DDP 容器中
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -339,13 +395,13 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
 
-# optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+# optimize!
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
+
 for step in range(max_steps):
     t0 = time.time()
     optimizer.zero_grad()
     loss_accum = 0.0
-
     for micro_step in range(grad_accum_steps):
         x,y = train_loader.next_batch()
         x,y = x.to(device),y.to(device)
@@ -353,7 +409,13 @@ for step in range(max_steps):
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             logits, loss = model(x, y)
         loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps -1)
         loss.backward()
+
+    if ddp:
+        dist.all_reduce(loss_accum, op = dist.ReduceOp.AVG) # 每个rank都将拥有存储在所有rank的梯度的平均值
     
     #对模型的梯度进行裁剪，以防止梯度爆炸（gradient explosion）
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -366,12 +428,16 @@ for step in range(max_steps):
 
     torch.cuda.synchronize() # wait for the GPU to finish work
     t1 = time.time()
-    dt = (t1 - t0)*1000  # time difference in miliseconds
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps 
-    tokens_per_sec = tokens_processed / (t1 - t0)
-    print(f"step {step} | loss: {loss.item()}| lr: {lr:.4f} | norm: {norm:.4f} | {dt:.2f}ms | token/sec:{tokens_per_sec}")
+    dt = t1 - t0  # time difference in miliseconds
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+    tokens_per_sec = tokens_processed / dt
+    if master_process:
+        print(f"step {step:4d} | loss: {loss_accum.item():.6f}| lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | token/sec:{tokens_per_sec:.2f}")
 
-import sys; sys.exit(0)
+if ddp:
+    destroy_process_group()
+
+import sys; sys.exit(0)  #退出
 
 # PREFIX TOKEN
 
